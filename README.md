@@ -3,6 +3,14 @@
 Walloc is a custom memory allocator implemented in Rust for WebAssembly applications, optimized for state machines that require aggressive re-allocation, while retaining safety.
 It provides efficient memory management with direct control over the WASM linear memory space, enabling high-performance memory utilization within browser environments.
 
+To test:
+
+- Ensure you have Cargo, Rustup, and the Rust toolchain installed.
+- Get the `wasm32-unknown-unknown` target using `rustup target add ...`.
+- Run `bash build.sh` from the `walloc/` directory.
+- Serve `index.html` and click the 'Start Simulation' button.
+- View the Console Output for test results.
+
 ## Key Features
 
 - Efficient Memory Utilization: Intelligently manages WebAssembly's linear memory, gradually growing as needed up to near the full 4GB address space.

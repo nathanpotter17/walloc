@@ -22,17 +22,17 @@ struct BlockHeader {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
-    Render = 0,   // Top tier: Mesh data, render targets (frequent reallocation, cache-aligned)
-    Scene = 1,    // Middle tier: Scene data, gameplay systems (medium lifecycle)
-    Entity = 2,   // Bottom tier: Actors, particles, effects (short lifecycle)
+    Top = 0,   // Top tier: frequent reallocation, cache-aligned
+    Middle = 1,    // Middle tier: medium lifecycle
+    Bottom = 2,   // Bottom tier: short lifecycle
 }
 
 impl Tier {
     fn from_u8(value: u8) -> Option<Tier> {
         match value {
-            0 => Some(Tier::Render),
-            1 => Some(Tier::Scene),
-            2 => Some(Tier::Entity),
+            0 => Some(Tier::Top),
+            1 => Some(Tier::Middle),
+            2 => Some(Tier::Bottom),
             _ => None,
         }
     }
@@ -93,9 +93,9 @@ impl Arena {
     pub fn allocate(&self, size: usize) -> Option<(*mut u8, usize)> {
         // Align size to appropriate boundary based on tier
         let aligned_size = match self.tier {
-            Tier::Render => (size + 127) & !127,  // 128-byte alignment for GPU warp access
-            Tier::Scene => (size + 63) & !63,     // 64-byte alignment for cache lines
-            Tier::Entity => (size + 7) & !7,      // 8-byte alignment for other tiers
+            Tier::Top => (size + 127) & !127,  // 128-byte alignment
+            Tier::Middle => (size + 63) & !63,     // 64-byte alignment
+            Tier::Bottom => (size + 7) & !7,      // Default 8-byte alignment
         };
         
         // Atomic compare-and-swap to reserve space
@@ -189,7 +189,7 @@ impl Arena {
 impl TieredAllocator {
     pub fn new(memory_base: *mut u8, memory_size: usize) -> Self {
         // Calculate sizes for each arena
-        // Render tier: 50% of memory, Scene tier: 30%, Entity tier: 20%
+        // first tier: 50% of memory, mid tier: 30%, btmn tier: 20%
         let render_size = (memory_size * 50) / 100;
         let scene_size = (memory_size * 30) / 100;
         let entity_size = (memory_size * 20) / 100;
@@ -199,9 +199,9 @@ impl TieredAllocator {
         let scene_base = unsafe { render_base.add(render_size) };
         let entity_base = unsafe { scene_base.add(scene_size) };
         
-        let render_arena = Arena::new(render_base, render_size, Tier::Render);
-        let scene_arena = Arena::new(scene_base, scene_size, Tier::Scene);
-        let entity_arena = Arena::new(entity_base, entity_size, Tier::Entity);
+        let render_arena = Arena::new(render_base, render_size, Tier::Top);
+        let scene_arena = Arena::new(scene_base, scene_size, Tier::Middle);
+        let entity_arena = Arena::new(entity_base, entity_size, Tier::Bottom);
         
         TieredAllocator {
             render_arena: Arc::new(Mutex::new(render_arena)),
@@ -218,21 +218,21 @@ impl TieredAllocator {
     pub fn fast_compact_tier(&mut self, tier: Tier, preserve_bytes: usize) -> bool {
         // Get current allocation and capacity for the specified tier
         let (current_offset, capacity) = match tier {
-            Tier::Render => {
+            Tier::Top => {
                 if let Ok(arena) = self.render_arena.lock() {
                     (arena.current_offset.load(Ordering::Relaxed), arena.capacity())
                 } else {
                     return false;
                 }
             },
-            Tier::Scene => {
+            Tier::Middle => {
                 if let Ok(arena) = self.scene_arena.lock() {
                     (arena.current_offset.load(Ordering::Relaxed), arena.capacity())
                 } else {
                     return false;
                 }
             },
-            Tier::Entity => {
+            Tier::Bottom => {
                 if let Ok(arena) = self.entity_arena.lock() {
                     (arena.current_offset.load(Ordering::Relaxed), arena.capacity())
                 } else {
@@ -280,9 +280,9 @@ impl TieredAllocator {
                 let preserve_data = if current_offset > 0 {
                     // Get a reference to the arena to copy data from
                     let arena_ref = match tier {
-                        Tier::Render => self.render_arena.clone(),
-                        Tier::Scene => self.scene_arena.clone(),
-                        Tier::Entity => self.entity_arena.clone(),
+                        Tier::Top => self.render_arena.clone(),
+                        Tier::Middle => self.scene_arena.clone(),
+                        Tier::Bottom => self.entity_arena.clone(),
                     };
                     
                     // Copy the data we want to preserve
@@ -319,7 +319,7 @@ impl TieredAllocator {
                 // Copy preserved data to the new arena if needed
                 if let Some(data) = preserve_data {
                     match tier {
-                        Tier::Render => {
+                        Tier::Top => {
                             if let Ok(arena) = self.render_arena.lock() {
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
@@ -332,7 +332,7 @@ impl TieredAllocator {
                                 arena.current_offset.store(data.len(), Ordering::SeqCst);
                             }
                         },
-                        Tier::Scene => {
+                        Tier::Middle => {
                             if let Ok(arena) = self.scene_arena.lock() {
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
@@ -344,7 +344,7 @@ impl TieredAllocator {
                                 arena.current_offset.store(data.len(), Ordering::SeqCst);
                             }
                         },
-                        Tier::Entity => {
+                        Tier::Bottom => {
                             if let Ok(arena) = self.entity_arena.lock() {
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
@@ -361,41 +361,41 @@ impl TieredAllocator {
                 
                 // Now ensure the offset is correctly set to preserve_bytes
                 match tier {
-                    Tier::Render => {
+                    Tier::Top => {
                         if let Ok(arena) = self.render_arena.lock() {
                             arena.current_offset.store(preserve_bytes, Ordering::SeqCst);
                         }
                     },
-                    Tier::Scene => {
+                    Tier::Middle => {
                         if let Ok(arena) = self.scene_arena.lock() {
                             arena.current_offset.store(preserve_bytes, Ordering::SeqCst);
                         }
                     },
-                    Tier::Entity => {
+                    Tier::Bottom => {
                         if let Ok(arena) = self.entity_arena.lock() {
                             arena.current_offset.store(preserve_bytes, Ordering::SeqCst);
                         }
                     },
                 }
                 
-                return true; // Successfully grew and preserved
+                return true;
             } else {
                 // We have enough capacity, just need to allocate up to preserve_bytes
                 match tier {
-                    Tier::Render => {
+                    Tier::Top => {
                         if let Ok(arena) = self.render_arena.lock() {
                             // Set the current offset to preserve_bytes
                             arena.current_offset.store(preserve_bytes, Ordering::SeqCst);
                             return true;
                         }
                     },
-                    Tier::Scene => {
+                    Tier::Middle => {
                         if let Ok(arena) = self.scene_arena.lock() {
                             arena.current_offset.store(preserve_bytes, Ordering::SeqCst);
                             return true;
                         }
                     },
-                    Tier::Entity => {
+                    Tier::Bottom => {
                         if let Ok(arena) = self.entity_arena.lock() {
                             arena.current_offset.store(preserve_bytes, Ordering::SeqCst);
                             return true;
@@ -406,17 +406,17 @@ impl TieredAllocator {
         } else {
             // Current allocation is sufficient, proceed with normal compact
             match tier {
-                Tier::Render => {
+                Tier::Top => {
                     if let Ok(arena) = self.render_arena.lock() {
                         return arena.fast_compact(preserve_bytes);
                     }
                 },
-                Tier::Scene => {
+                Tier::Middle => {
                     if let Ok(arena) = self.scene_arena.lock() {
                         return arena.fast_compact(preserve_bytes);
                     }
                 },
-                Tier::Entity => {
+                Tier::Bottom => {
                     if let Ok(arena) = self.entity_arena.lock() {
                         return arena.fast_compact(preserve_bytes);
                     }
@@ -450,17 +450,17 @@ impl TieredAllocator {
         
         // Based on the tier, update or replace the corresponding arena
         match tier {
-            Tier::Render => {
+            Tier::Top => {
                 if let Ok(mut old_arena) = self.render_arena.lock() {
                     *old_arena = new_arena;
                 }
             },
-            Tier::Scene => {
+            Tier::Middle => {
                 if let Ok(mut old_arena) = self.scene_arena.lock() {
                     *old_arena = new_arena;
                 }
             },
-            Tier::Entity => {
+            Tier::Bottom => {
                 if let Ok(mut old_arena) = self.entity_arena.lock() {
                     *old_arena = new_arena;
                 }
@@ -474,9 +474,9 @@ impl TieredAllocator {
     
     pub fn allocate_with_owner(&mut self, size: usize, tier: Tier) -> Option<(MemoryOwner, *mut u8)> {
         let arena = match tier {
-            Tier::Render => &self.render_arena,
-            Tier::Scene => &self.scene_arena,
-            Tier::Entity => &self.entity_arena,
+            Tier::Top => &self.render_arena,
+            Tier::Middle => &self.scene_arena,
+            Tier::Bottom => &self.entity_arena,
         };
         
         // Try to allocate from the selected arena
@@ -504,9 +504,9 @@ impl TieredAllocator {
         
         // Try allocation again with the newly expanded arena
         let arena = match tier {
-            Tier::Render => &self.render_arena,
-            Tier::Scene => &self.scene_arena,
-            Tier::Entity => &self.entity_arena,
+            Tier::Top => &self.render_arena,
+            Tier::Middle => &self.scene_arena,
+            Tier::Bottom => &self.entity_arena,
         };
         
         // Try to allocate from the selected arena after growing
@@ -530,9 +530,9 @@ impl TieredAllocator {
     pub fn allocate(&mut self, size: usize, tier: Tier) -> *mut u8 {
         // First attempt: try to allocate from the selected arena
         let arena = match tier {
-            Tier::Render => &self.render_arena,
-            Tier::Scene => &self.scene_arena,
-            Tier::Entity => &self.entity_arena,
+            Tier::Top => &self.render_arena,
+            Tier::Middle => &self.scene_arena,
+            Tier::Bottom => &self.entity_arena,
         };
         
         if let Ok(arena_lock) = arena.lock() {
@@ -547,9 +547,9 @@ impl TieredAllocator {
         // If growth succeeded, try allocation again
         if !ptr.is_null() {
             let arena = match tier {
-                Tier::Render => &self.render_arena,
-                Tier::Scene => &self.scene_arena,
-                Tier::Entity => &self.entity_arena,
+                Tier::Top => &self.render_arena,
+                Tier::Middle => &self.scene_arena,
+                Tier::Bottom => &self.entity_arena,
             };
             
             if let Ok(arena_lock) = arena.lock() {
@@ -562,21 +562,21 @@ impl TieredAllocator {
             
             // Get current stats for this tier to determine how much we're using
             let (current_usage, _, _, _) = match tier {
-                Tier::Render => {
+                Tier::Top => {
                     if let Ok(arena) = self.render_arena.lock() {
                         arena.get_stats()
                     } else {
                         (0, 0, 0, 0)
                     }
                 },
-                Tier::Scene => {
+                Tier::Middle => {
                     if let Ok(arena) = self.scene_arena.lock() {
                         arena.get_stats()
                     } else {
                         (0, 0, 0, 0)
                     }
                 },
-                Tier::Entity => {
+                Tier::Bottom => {
                     if let Ok(arena) = self.entity_arena.lock() {
                         arena.get_stats()
                     } else {
@@ -597,9 +597,9 @@ impl TieredAllocator {
                 
                 // Try allocation again after resetting
                 let arena = match tier {
-                    Tier::Render => &self.render_arena,
-                    Tier::Scene => &self.scene_arena,
-                    Tier::Entity => &self.entity_arena,
+                    Tier::Top => &self.render_arena,
+                    Tier::Middle => &self.scene_arena,
+                    Tier::Bottom => &self.entity_arena,
                 };
                 
                 if let Ok(arena_lock) = arena.lock() {
@@ -614,7 +614,6 @@ impl TieredAllocator {
         std::ptr::null_mut()
     }
     
-    // Check if pointer is in any arena
     pub fn is_ptr_in_arena(&self, ptr: *mut u8) -> bool {
         if let Ok(arena) = self.render_arena.lock() {
             if arena.contains(ptr) {
@@ -637,20 +636,19 @@ impl TieredAllocator {
         false
     }
     
-    // Reset a specific tier
     pub fn reset_tier(&mut self, tier: Tier) {
         match tier {
-            Tier::Render => {
+            Tier::Top => {
                 if let Ok(arena) = self.render_arena.lock() {
                     arena.reset();
                 }
             },
-            Tier::Scene => {
+            Tier::Middle => {
                 if let Ok(arena) = self.scene_arena.lock() {
                     arena.reset();
                 }
             },
-            Tier::Entity => {
+            Tier::Bottom => {
                 if let Ok(arena) = self.entity_arena.lock() {
                     arena.reset();
                 }
@@ -660,21 +658,21 @@ impl TieredAllocator {
     
     pub fn tier_stats(&self, tier: Tier) -> (usize, usize, usize, usize) {
         match tier {
-            Tier::Render => {
+            Tier::Top => {
                 if let Ok(arena) = self.render_arena.lock() {
                     arena.get_stats()
                 } else {
                     (0, 0, 0, 0)
                 }
             },
-            Tier::Scene => {
+            Tier::Middle => {
                 if let Ok(arena) = self.scene_arena.lock() {
                     arena.get_stats()
                 } else {
                     (0, 0, 0, 0)
                 }
             },
-            Tier::Entity => {
+            Tier::Bottom => {
                 if let Ok(arena) = self.entity_arena.lock() {
                     arena.get_stats()
                 } else {
@@ -684,7 +682,6 @@ impl TieredAllocator {
         }
     }
     
-    // Check if a pointer is valid
     pub fn is_ptr_valid(&self, ptr: *mut u8) -> bool {
         self.is_ptr_in_arena(ptr)
     }
@@ -735,18 +732,15 @@ impl TieredAllocator {
 
         let data_size = bytes.len();
 
-        // Allocate memory in the Scene tier
-        let ptr = self.allocate(data_size, Tier::Scene);
+        let ptr = self.allocate(data_size, Tier::Middle);
         
         if ptr.is_null() {
             return Err(JsValue::from_str("Failed to allocate memory for asset"));
         }
         
-        // Calculate offset from memory base
-        let memory_base = self.get_memory_base(Tier::Scene);
+        let memory_base = self.get_memory_base(Tier::Middle);
         let offset = (ptr as usize) - (memory_base as usize);
         
-        // Copy bytes into memory
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, data_size);
         }
@@ -768,24 +762,23 @@ impl TieredAllocator {
         Ok(offset)
     }
 
-    // Get memory base pointer for a specific tier
     fn get_memory_base(&self, tier: Tier) -> *mut u8 {
         match tier {
-            Tier::Render => {
+            Tier::Top => {
                 if let Ok(arena) = self.render_arena.lock() {
                     arena.base
                 } else {
                     std::ptr::null_mut()
                 }
             },
-            Tier::Scene => {
+            Tier::Middle => {
                 if let Ok(arena) = self.scene_arena.lock() {
                     arena.base
                 } else {
                     std::ptr::null_mut()
                 }
             },
-            Tier::Entity => {
+            Tier::Bottom => {
                 if let Ok(arena) = self.entity_arena.lock() {
                     arena.base
                 } else {
@@ -820,14 +813,12 @@ impl TieredAllocator {
     }
 
     pub fn evict_asset(&mut self, path: &str) -> Result<(), JsValue> {
-        // First, get information about the target asset
         let target_metadata = {
             let assets_lock = match self.assets.lock() {
                 Ok(lock) => lock,
                 Err(_) => return Err(JsValue::from_str("Failed to acquire assets lock")),
             };
             
-            // Check if the asset exists
             match assets_lock.get(path) {
                 Some(meta) => meta.clone(),
                 None => return Err(JsValue::from_str(&format!("Asset not found: {}", path))),
@@ -844,13 +835,10 @@ impl TieredAllocator {
             let mut preserve_buffer = Vec::new();
             let mut preserve_map = HashMap::new();
             
-            // Get memory base for Scene tier
-            let memory_base = self.get_memory_base(Tier::Scene);
+            let memory_base = self.get_memory_base(Tier::Middle);
             
-            // Copy all assets except the one being evicted
             for (asset_path, metadata) in assets_lock.iter() {
                 if asset_path != path {
-                    // Record the current position in our buffer
                     let new_offset = preserve_buffer.len();
                     
                     // Read the asset's bytes
@@ -874,21 +862,17 @@ impl TieredAllocator {
             (preserve_buffer, preserve_map)
         };
         
-        // Now reset the entire scene tier
-        self.reset_tier(Tier::Scene);
+        self.reset_tier(Tier::Middle);
         
-        // If we have assets to preserve, reallocate and copy them back
         if !preserve_buffer.is_empty() {
-            // Allocate new memory for the preserved data
             let buffer_size = preserve_buffer.len();
-            let ptr = self.allocate(buffer_size, Tier::Scene);
+            let ptr = self.allocate(buffer_size, Tier::Middle);
             
             if ptr.is_null() {
                 return Err(JsValue::from_str("Failed to allocate memory for preserved assets"));
             }
             
-            // Calculate offset
-            let memory_base = self.get_memory_base(Tier::Scene);
+            let memory_base = self.get_memory_base(Tier::Middle);
             let offset = (ptr as usize) - (memory_base as usize);
             
             // Copy the preserved data back to WebAssembly memory
@@ -954,7 +938,7 @@ impl TieredAllocator {
         // Drop assets lock before accessing memory
         drop(assets_lock);
         
-        let memory_base = self.get_memory_base(Tier::Scene);
+        let memory_base = self.get_memory_base(Tier::Middle);
         
         unsafe {
             let ptr = memory_base.add(metadata.offset);
@@ -1030,7 +1014,6 @@ impl Walloc {
         self.strategy.get_asset(&path)
     }
     
-    // Get a direct view into WASM memory as a typed array
     #[wasm_bindgen]
     pub fn get_memory_view(&self, offset: usize, length: usize) -> Result<js_sys::Uint8Array, JsValue> {
         if offset + length > self.memory_size {
@@ -1044,21 +1027,19 @@ impl Walloc {
         }
     }
     
-    // Allocate memory from a specific tier
     #[wasm_bindgen]
     pub fn allocate_tiered(&mut self, size: usize, tier_number: u8) -> usize {
         let tier = match Tier::from_u8(tier_number) {
             Some(t) => t,
-            None => Tier::Entity, // Default to Entity tier if invalid
+            None => Tier::Bottom, //Default
         };
 
         let ptr = self.strategy.allocate(size, tier);
 
         self.memory_size = core::arch::wasm32::memory_size(0) * 65536;
         
-        // Return offset from memory base
         if ptr.is_null() {
-            0 // Error case, return 0 (null) pointer
+            0
         } else {
             (ptr as usize) - (self.memory_base as usize)
         }
@@ -1074,7 +1055,6 @@ impl Walloc {
         self.strategy.fast_compact_tier(tier, preserve_bytes)
     }
     
-    // Reset a specific tier
     #[wasm_bindgen]
     pub fn reset_tier(&mut self, tier_number: u8) -> bool {
         let tier = match Tier::from_u8(tier_number) {
@@ -1086,7 +1066,6 @@ impl Walloc {
         true
     }
 
-    // Copy data from JS to WASM memory
     #[wasm_bindgen]
     pub fn copy_from_js(&mut self, offset: usize, data: &js_sys::Uint8Array) -> Result<(), JsValue> {
         let data_len = data.length() as usize;
@@ -1102,25 +1081,20 @@ impl Walloc {
         }
     }
     
-    // Copy data from WASM memory to JS
     #[wasm_bindgen]
     pub fn copy_to_js(&self, offset: usize, length: usize) -> Result<js_sys::Uint8Array, JsValue> {
         self.get_memory_view(offset, length)
     }
     
-    // Memory statistics
     #[wasm_bindgen]
     pub fn memory_stats(&self) -> js_sys::Object {
         let obj = js_sys::Object::new();
         
-        // Get current memory size from WebAssembly directly
         let current_pages = core::arch::wasm32::memory_size(0);
         let current_size = current_pages * 65536;
         
-        // Track total in-use memory
         let mut total_in_use = 0;
         
-        // Add tier information
         let tiers = js_sys::Array::new();
         
         for tier_num in 0..3 {
@@ -1128,16 +1102,15 @@ impl Walloc {
                 let (used, capacity, high_water, total_allocated) = self.strategy.tier_stats(tier);
                 let tier_obj = js_sys::Object::new();
                 
-                // Add current usage to total
                 total_in_use += used;
                 
                 js_sys::Reflect::set(
                     &tier_obj,
                     &JsValue::from_str("name"),
                     &JsValue::from_str(match tier {
-                        Tier::Render => "render",
-                        Tier::Scene => "scene",
-                        Tier::Entity => "entity",
+                        Tier::Top => "render",
+                        Tier::Middle => "scene",
+                        Tier::Bottom => "entity",
                     })
                 ).unwrap();
                 
@@ -1165,7 +1138,6 @@ impl Walloc {
                     &JsValue::from_f64(total_allocated as f64)
                 ).unwrap();
                 
-                // Calculate memory savings
                 let saved = if total_allocated > used {
                     total_allocated - used
                 } else {
@@ -1188,14 +1160,12 @@ impl Walloc {
             &tiers
         ).unwrap();
         
-        // Set the total size to the in-use memory (not just raw WASM memory size)
         js_sys::Reflect::set(
             &obj, 
             &JsValue::from_str("totalSize"), 
             &JsValue::from_f64(total_in_use as f64)
         ).unwrap();
         
-        // Add raw memory pages info
         js_sys::Reflect::set(
             &obj,
             &JsValue::from_str("pages"),
@@ -1208,14 +1178,12 @@ impl Walloc {
             &JsValue::from_f64(current_size as f64)
         ).unwrap();
         
-        // Add allocator type
         js_sys::Reflect::set(
             &obj,
             &JsValue::from_str("allocatorType"),
             &JsValue::from_str("tiered")
         ).unwrap();
         
-        // Add useful utilization percentage
         js_sys::Reflect::set(
             &obj,
             &JsValue::from_str("memoryUtilization"),
