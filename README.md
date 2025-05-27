@@ -148,9 +148,9 @@ After new allocations:
 | Important data          | Newly allocated objects | "Garbage" data, but     |
 | (preserved, 1MB)        | (1.5MB)                 | available for reuse     |
 |-------------------------|-------------------------|-------------------------|
-                                              ^                               ^
-                                              |                               |
-                                    current_offset = 2.5MB          capacity = 4MB
+                                                    ^                         ^
+                                                    |                         |
+                                          current_offset = 2.5MB     capacity = 4MB
 ```
 
 This approach is perfect for high performance loops because:
