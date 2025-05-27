@@ -20,6 +20,12 @@ To test:
 - Browser Compatibility: Designed to work around browser-specific memory limitations while maximizing available memory.
 - Intelligent Design: Walloc allocator is automatically configured so we dont accidentally grow into the stack memory occupied by our program.
 
+## Technical Details
+
+- The allocator manages WebAssembly memory pages (64KB chunks) and provides a familiar malloc/free interface. It includes mechanisms for safely transferring data between JavaScript and WebAssembly memory spaces via typed arrays, with built-in bounds checking for memory safety.
+- Rust is the perfect language to implement this because of its ownership and scope models help prevent unsafe memory patterns, and a lot of the built in memory functions for Rust are safe wrappers of C instructions. Focusing on supporting safe and efficient memory reuse.
+- To allow for a smooth memory usage experience, the TieredAllocator doesnt auto-rebalance its memory, although it does start with a defined reserved space, where the Top tier takes 50%, the Middle tier takes 30%, and the bottom tier takes the final 20%. The limits are up to the implementor though, each tier is allowed to grow to the maximum available memory for flexibility.
+
 ## Aside: Memory in WASM
 
 - WebAssembly linear memory: WebAssembly memories represent a contiguous array of bytes that have a size that is always a multiple of the
@@ -28,13 +34,6 @@ To test:
   The native code of the host calls wasm_runtime_module_malloc to allocate buffer from the Wasm app's heap, and then use it
   for sharing data between host and Wasm.
 - The WebAssembly module starts with a certain number of memory pages by default. Emscripten's default is 16 pages. This initial allocation is determined by EMCC or the Rust/WebAssembly compiler toolchain based on the static requirements of the program, with some extra space allocated for the heap.
-
-## Technical Details
-
-- The allocator manages WebAssembly memory pages (64KB chunks) and provides a familiar malloc/free interface. It includes mechanisms for safely transferring data between JavaScript and WebAssembly memory spaces via typed arrays, with built-in bounds checking for memory safety.
-- Rust is the perfect language to implement this because of its ownership and scope models help prevent unsafe memory patterns, and a lot of the built in memory functions for Rust are safe wrappers of C instructions.
-- This component forms the foundation layer of a 3D rendering engine, enabling optimized memory patterns for graphics data like geometry buffers, textures, and scene graph information, with a focus on supporting safe and efficient memory reuse.
-- To allow for a smooth memory usage experience, the TieredAllocator doesnt auto-rebalance its memory, although it does start with a defined reserved space, where the render tier takes 50%, the scene tier takes 30%, and the entity tier takes the final 20%. The limits are up to the implementor though, each tier is allowed to grow to the maximum available memory for scene flexibility.
 
 ## Technical Specs
 
@@ -63,28 +62,20 @@ To test:
             - Layout
 
               ```
-              Render Tier (50%)
+              Top Tier (50%)
                 - 128-byte aligned
-                - Optimized for GPU access
-              Scene Tier (30%)
-
+              Middle Tier (30%)
                 - 64-byte aligned
-                - Medium lifecycle objects
-
-              Entity Tier (15%)
-
+              Bottom Tier (20%)
                 - 8-byte aligned
-                - Short-lived objects
-
-              Fallback (5%)
-                - Traditional allocator
+                - Short-lived items
               ```
 
             - Performance Considerations
 
               - Allocation in arenas is O(1) using atomic bump allocation
               - Deallocation of entire tiers is O(1)
-              - Individual deallocations within arenas are not supported (use contexts instead)
+              - Individual deallocations within arenas are not supported (use contexts and preservation instead)
               - Arena-based allocation avoids fragmentation
 
             - Thread Safety
@@ -97,31 +88,31 @@ To test:
               - Uses WebAssembly's linear memory model
               - Memory pages are 64KB each
               - The allocator automatically grows memory when needed
-              - Proper memory alignment ensures optimal performance for GPU access
+              - Proper memory alignment ensures optimal performance
 
 ## Review: Borrowing & Ownership Model
 
-- Independent Reference Counting: Each arena (Render, Scene, Entity) has its own Arc<Mutex<>>, meaning its lifetime is managed independently.
-- No Hierarchical Ownership: When a SceneContext is dropped, it doesn't automatically drop the EntityContext objects created from it. Each has its own separate reference count.
-- Manual Reset Required: Without nested lifetimes, you need to explicitly call reset_tier() to clear a tier - dropping a SceneContext doesn't automatically reset its arena.
-  This is optimal considering Rust's approach to borrowing and ownership.
+- Independent Reference Counting: Each arena (Top, Middle, Bottom) has its own Arc<Mutex<>>, meaning its lifetime is managed independently.
+- No Hierarchical Ownership: When a tier is dropped, it doesn't automatically drop the lower tiers objects created from it. Each has its own separate reference count.
+- Manual Reset Required: Without nested lifetimes, you need to explicitly call reset_tier() to clear a tier - dropping a tier doesn't automatically reset its arena.
 
-  - Each arrow represents an Arc reference, and when all references to an arena are gone, the Arc is dropped, but the memory isn't fully reclaimed until you explicitly reset the arena.
-    - While this may seem problematic to not enforce garbage collection or a full reset after the Arc is dropped, it allows for the engine to maintain its speed, and leaves the region
-      in the hands of the developer.
-  - ```
-    Scene ------> has reference to ----> Scene Arena
-          |
-          +--> creates --> Entity A ------> has reference to ----> Entity Arena
-          |
-          +--> creates --> Entity B ------> has reference to ----> Entity Arena
-    ```
+This is optimal considering Rust's approach to borrowing and ownership.
+
+- Each arrow represents an Arc reference, and when all references to an arena are gone, the Arc is dropped, but the memory isn't fully reclaimed until you explicitly reset the arena.
+  - While this may seem problematic to not enforce garbage collection or a full reset after the Arc is dropped, it allows for the engine to maintain its speed, and leaves the region in the hands of the developer.
+- ```
+  Middle Arena ------> has reference to ----> Middle Arena
+        |
+        +--> creates --> Bottom A ------> has reference to ----> Bottom Arena
+        |
+        +--> creates --> Bottom B ------> has reference to ----> Bottom Arena
+  ```
 
 ## Review: Recycle Model
 
-When you call fast_compact_tier(TIER.SCENE, 1 \* MB), here's what happens:
+When you call fast_compact_tier(TIER.Middle, 1 \* MB), here's what happens:
 
-1. The first 1 \* MB of memory in the SCENE tier is preserved exactly as-is
+1. The first 1 \* MB of memory in the Middle tier is preserved exactly as-is
 2. The allocation pointer is simply reset to the position right after this preserved section
 3. Any new allocations will automatically start from this new position (after the preserved area)
 4. The old data beyond the preserved area remains in memory as "garbage" but will be overwritten by new allocations
@@ -129,10 +120,10 @@ When you call fast_compact_tier(TIER.SCENE, 1 \* MB), here's what happens:
 This enables a very efficient way to keep important data while recycling the rest of the memory. There's no expensive memory copying involved - it's just a pointer adjustment, which is extremely fast.
 
 ```
-Before fast_compact_tier(TIER.SCENE, 1MB):
+Before fast_compact_tier(TIER.Middle, 1MB):
 [TIER BASE]
 |-------------------------|-------------------------|-------------------------|
-| Important level data    | Current scene objects   | Recently culled objects |
+| Important data          | Current objects         | Recently de-allocated   |
 | (1MB)                   | (2MB)                   | (1MB)                   |
 |-------------------------|-------------------------|-------------------------|
                           ^                                                   ^
@@ -140,10 +131,10 @@ Before fast_compact_tier(TIER.SCENE, 1MB):
                   current_offset = 3MB                               capacity = 4MB
 
 
-After fast_compact_tier(TIER.SCENE, 1MB):
+After fast_compact_tier(TIER.Middle, 1MB):
 [TIER BASE]
 |-------------------------|-------------------------|-------------------------|
-| Important level data    | "Garbage" data, but     | "Garbage" data, but     |
+| Important data          | "Garbage" data, but     | "Garbage" data, but     |
 | (preserved, 1MB)        | available for reuse     | available for reuse     |
 |-------------------------|-------------------------|-------------------------|
                           ^                                                   ^
@@ -154,7 +145,7 @@ After fast_compact_tier(TIER.SCENE, 1MB):
 After new allocations:
 [TIER BASE]
 |-------------------------|-------------------------|-------------------------|
-| Important level data    | Newly allocated objects | "Garbage" data, but     |
+| Important data          | Newly allocated objects | "Garbage" data, but     |
 | (preserved, 1MB)        | (1.5MB)                 | available for reuse     |
 |-------------------------|-------------------------|-------------------------|
                                               ^                               ^
@@ -162,19 +153,18 @@ After new allocations:
                                     current_offset = 2.5MB          capacity = 4MB
 ```
 
-This approach is perfect for game loops because:
+This approach is perfect for high performance loops because:
 
-You can organize your memory so that persistent data (level geometry, shared textures) is at the beginning
-Transient data (dynamic objects, particles) comes after.
+You can organize your memory so that persistent data is at the beginning and transient data comes after.
 
 When you need to recycle memory, you just preserve the persistent part and reuse the rest.
 The operation is incredibly fast since it's just an atomic store to update the allocation pointer.
 
 All new allocations will automatically respect the preserved area because the allocator's internal current_offset is pointing just after it. This is all handled seamlessly by the bump allocator design.
 
-Matches game scene lifecycle perfectly:
+Matches high performance lifecycle perfectly:
 
-- Persistent level data stays at the beginning (preserved section)
+- Persistent data stays at the beginning (preserved section)
 - Current visible/active objects occupy the middle (new allocations)
 - Previously visible but now culled objects' memory is automatically recycled
 
@@ -186,7 +176,7 @@ Zero-cost memory recycling:
 
 Perfect alignment with visibility culling:
 
-- As the player moves through the game world, new objects come into view while others leave
+- As the player moves through the high performance world, new objects come into view while others leave
 - This allocator naturally accommodates this pattern without complex memory tracking
 
 Efficient for WASM environments:
@@ -220,11 +210,11 @@ Solution: Always invalidate the cache before setting the availability flag. This
 This prevents the race condition where cache contains outdated information while the flag indicates data is ready.
 This technique is called "polling" or "scheduled polling" and is common in page based memory allocators.
 
-## Advanced Considerations - For Frequent Allocations
+## Advanced Considerations - Partially Implemented
 
 ### Vectorization and SIMD
 
-Since you're in a WebAssembly context, you can use SIMD (Single Instruction, Multiple Data) instructions to process multiple bytes at once:
+WASM can use SIMD (Single Instruction, Multiple Data) instructions to process multiple bytes at once:
 
 ```rust
 // Import WASM SIMD intrinsics
@@ -254,6 +244,8 @@ pub fn fast_fill(ptr: *mut u8, size: usize, value: u8) {
 
 ### Type Punning for Wider Access
 
+Use a wider type for more efficient memory access:
+
 ```rust
 pub fn fast_copy_u32(src: *const u8, dst: *mut u8, count_bytes: usize) {
     let count_u32 = count_bytes / 4;
@@ -280,7 +272,7 @@ pub fn fast_copy_u32(src: *const u8, dst: *mut u8, count_bytes: usize) {
 
 ### Alignment Operations
 
-Ensuring your memory operations are aligned to cache line boundaries (64 bytes) can significantly improve performance:
+Ensuring your memory operations are aligned to cache line boundaries:
 
 ```rust
 pub fn aligned_copy(src: *const u8, dst: *mut u8, size: usize) {
