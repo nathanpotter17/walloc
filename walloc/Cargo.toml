@@ -3,14 +3,26 @@ name = "walloc"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "walloc-bin"
+path = "src/main.rs"
+
 [lib]
 name = "walloc"
 path = "src/lib.rs"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+reqwest = { version = "0.12.15", features = ["json"] }
+bytemuck = { version = "1.0", features = ["derive"] }
+futures = "0.3.31"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.0", features = ["rt", "macros"] }
 js-sys = "0.3.77"
-reqwest = "0.12.15"
 wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4.50"
 web-sys = {version = "0.3.77", features = ["console"]}

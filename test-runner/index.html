@@ -83,28 +83,13 @@
     <h2 style="font-style: italic">WebAssembly Memory Allocator</h2>
 
     <p>
-      This page loads the WALLOC library from LAYER W for memory management in
-      WebAssembly.<br />
+      This page loads the WALLOC library from LAYER W (BSD3) for cross platform
+      memory management.<br />
       Memory chunks are 64KiB, the max size of a WASM Page, however, the
       allocator can accept an arbitrary number of bytes above the minimum of 1
-      page. Total maximum allocation size is 65,536 pages. <br />(2^16 pages is
-      2^16 * 64KiB = 4GiB)
+      page. Total maximum allocation size is 65,535 pages. <br />(2^16 pages is
+      2^16 * 64KiB = ~4GiB)
     </p>
-
-    <p style="font-style: italic">When do you need memory?</p>
-    <p>You must instantiate WebAssembly.Memory only if:</p>
-    <ul style="color: #aaaaaa">
-      <li>The module imports memory from the environment.</li>
-      <li>The module defines memory internally (and uses it).</li>
-      <li>
-        Your runtime or compiled code (e.g., from C/C++ via Emscripten) expects
-        it for heap/stack.
-      </li>
-      <li>
-        If you're manually writing WAT (WebAssembly Text) or compiling from
-        minimal Rust/AssemblyScript, you can skip memory declaration entirely.
-      </li>
-    </ul>
 
     <div class="demo-container">
       <h2 style="font-style: italic">WALLOC Dashboard</h2>
@@ -112,19 +97,11 @@
         <h3>Memory Statistics & Growth Testing</h3>
         <pre id="memory-stats">Loading...</pre>
       </div>
-      <div class="control-group">
-        <h3>Game Sim Controls</h3>
-        <div style="flex-direction: row">
-          <button id="start-btn">Start Simulation</button>
-          <button id="stop-btn">Stop Simulation</button>
-        </div>
-      </div>
 
       <h3>Console Output</h3>
       <div id="console" class="console"></div>
     </div>
 
-    <script type="module" src="tiered.js"></script>
-    <!-- <script type="module" src="main.js"></script> -->
+    <script type="module" src="main.js"></script>
   </body>
 </html>

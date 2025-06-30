@@ -1,299 +1,285 @@
-# WALLOC: A WebAssembly memory allocator using Rust
+# WALLOC: A Cohesive High-Performance Memory Allocator
 
-Walloc is a custom memory allocator implemented in Rust for WebAssembly applications, optimized for state machines that require aggressive re-allocation, while retaining safety.
-It provides efficient memory management with direct control over the WASM linear memory space, enabling high-performance memory utilization within browser environments.
-
-To test:
-
-- Ensure you have Cargo, Rustup, and the Rust toolchain installed.
-- Get the `wasm32-unknown-unknown` target using `rustup target add ...`.
-- Run `bash build.sh` from the `walloc/` directory.
-- Serve `index.html` and click the 'Start Simulation' button.
-- View the Console Output for test results.
+Walloc is a streamlined tiered memory management system optimized for both WebAssembly and Native applications. It provides efficient memory management with direct control over memory spaces, enabling high-performance memory utilization across browser environments and native applications.
 
 ## Key Features
 
-- Efficient Memory Utilization: Intelligently manages WebAssembly's linear memory, gradually growing as needed up to near the full 4GB address space.
-- Direct Memory Access: Provides low-level memory manipulation with typed array views, supporting raw memory operations critical for graphics applications.
-- Configurable Allocation Strategy: Uses a first-fit allocation strategy for speed with block splitting and coalescing to minimize fragmentation.
-- Memory Lifecycle Management: Supports allocation, deallocation, reallocation, and complete memory reset functionality.
-- Browser Compatibility: Designed to work around browser-specific memory limitations while maximizing available memory.
-- Intelligent Design: Walloc allocator is automatically configured so we dont accidentally grow into the stack memory occupied by our program.
+- **Lock-Free Allocation**: Thread-safe memory operations without mutex contention
+- **Tiered Memory Architecture**: Optimized for different allocation patterns and lifetimes
+- **Global Offset Architecture**: Cross-platform pointer safety with zero-cost abstraction
+- **Vectorized SIMD Operations**: Accelerated memory operations using platform-specific SIMD
+- **Asset Registry**: Fast asset registration and lookup with HTTP loading support
+- **Zero-Cost Memory Recycling**: Fast compaction without memory movement
+- **Direct Memory Access**: Low-level memory manipulation with typed array views
+- **Browser Compatibility**: Designed to work around browser-specific memory limitations
 
-## Technical Details
+## Technical Architecture
 
-- The allocator manages WebAssembly memory pages (64KB chunks) and provides a familiar malloc/free interface. It includes mechanisms for safely transferring data between JavaScript and WebAssembly memory spaces via typed arrays, with built-in bounds checking for memory safety.
-- Rust is the perfect language to implement this because of its ownership and scope models help prevent unsafe memory patterns, and a lot of the built in memory functions for Rust are safe wrappers of C instructions. Focusing on supporting safe and efficient memory reuse.
-- To allow for a smooth memory usage experience, the TieredAllocator doesnt auto-rebalance its memory, although it does start with a defined reserved space, where the Top tier takes 50%, the Middle tier takes 30%, and the bottom tier takes the final 20%. The limits are up to the implementor though, each tier is allowed to grow to the maximum available memory for flexibility.
+### Tiered Memory Organization
 
-## Aside: Memory in WASM
+Walloc features a three-tier memory system optimized for different use cases:
 
-- WebAssembly linear memory: WebAssembly memories represent a contiguous array of bytes that have a size that is always a multiple of the
-  WebAssembly page size (64KiB).
-- The Wasm heap is located in its own linear memory space. There are two typical usages of heap: Wasm code calls malloc/free on its own heap.
-  The native code of the host calls wasm_runtime_module_malloc to allocate buffer from the Wasm app's heap, and then use it
-  for sharing data between host and Wasm.
-- The WebAssembly module starts with a certain number of memory pages by default. Emscripten's default is 16 pages. This initial allocation is determined by EMCC or the Rust/WebAssembly compiler toolchain based on the static requirements of the program, with some extra space allocated for the heap.
+| Tier   | Allocation | Alignment | Use Case                    |
+| ------ | ---------- | --------- | --------------------------- |
+| Top    | 50%        | 128-byte  | GPU/Render assets           |
+| Middle | 30%        | 64-byte   | Scene/Assets                |
+| Bottom | 20%        | 8-byte    | Temporary/short-lived items |
 
-## Technical Specs
+### Global Offset Architecture
 
-- Walloc Allocator
-
-  - Walloc's WASM Binary is only 356 KB
-  - Walloc's JS Glue Code is 30 KB
-  - Walloc's Startup Runtime Memory for WASM is 1.125MB (Default, Reserved) (~18 Pages)
-
-    - This initial memory allocation includes:
-
-      - Compiled Rust code (the Walloc implementation and all other functions)
-      - WebAssembly runtime overhead
-      - The static data segment (global variables, constant data)
-      - Initial stack space
-      - The heap area that Walloc will manage
-
-    - Walloc has both a default allocator and a tiered allocator that uses the default as fallback.
-
-      - The default allocator exposes itself to the Web via JS, constructed by wasm-bindgen.
-
-        - Walloc::new() yields a new default allocator, and new_tiered yields the tiered allocator.
-
-          - Memory Layout & Design - Technical Details
-
-            - Layout
-
-              ```
-              Top Tier (50%)
-                - 128-byte aligned
-              Middle Tier (30%)
-                - 64-byte aligned
-              Bottom Tier (20%)
-                - 8-byte aligned
-                - Short-lived items
-              ```
-
-            - Performance Considerations
-
-              - Allocation in arenas is O(1) using atomic bump allocation
-              - Deallocation of entire tiers is O(1)
-              - Individual deallocations within arenas are not supported (use contexts and preservation instead)
-              - Arena-based allocation avoids fragmentation
-
-            - Thread Safety
-
-              - All arena operations use atomic operations for thread safety
-              - Mutexes protect concurrent access to arenas
-              - Arc enables safe sharing of arenas between contexts
-
-            - Implementation Notes
-              - Uses WebAssembly's linear memory model
-              - Memory pages are 64KB each
-              - The allocator automatically grows memory when needed
-              - Proper memory alignment ensures optimal performance
-
-## Review: Borrowing & Ownership Model
-
-- Independent Reference Counting: Each arena (Top, Middle, Bottom) has its own Arc<Mutex<>>, meaning its lifetime is managed independently.
-- No Hierarchical Ownership: When a tier is dropped, it doesn't automatically drop the lower tiers objects created from it. Each has its own separate reference count.
-- Manual Reset Required: Without nested lifetimes, you need to explicitly call reset_tier() to clear a tier - dropping a tier doesn't automatically reset its arena.
-
-This is optimal considering Rust's approach to borrowing and ownership.
-
-- Each arrow represents an Arc reference, and when all references to an arena are gone, the Arc is dropped, but the memory isn't fully reclaimed until you explicitly reset the arena.
-  - While this may seem problematic to not enforce garbage collection or a full reset after the Arc is dropped, it allows for the engine to maintain its speed, and leaves the region in the hands of the developer.
-- ```
-  Middle Arena ------> has reference to ----> Middle Arena
-        |
-        +--> creates --> Bottom A ------> has reference to ----> Bottom Arena
-        |
-        +--> creates --> Bottom B ------> has reference to ----> Bottom Arena
-  ```
-
-## Review: Recycle Model
-
-When you call fast_compact_tier(TIER.Middle, 1 \* MB), here's what happens:
-
-1. The first 1 \* MB of memory in the Middle tier is preserved exactly as-is
-2. The allocation pointer is simply reset to the position right after this preserved section
-3. Any new allocations will automatically start from this new position (after the preserved area)
-4. The old data beyond the preserved area remains in memory as "garbage" but will be overwritten by new allocations
-
-This enables a very efficient way to keep important data while recycling the rest of the memory. There's no expensive memory copying involved - it's just a pointer adjustment, which is extremely fast.
-
-```
-Before fast_compact_tier(TIER.Middle, 1MB):
-[TIER BASE]
-|-------------------------|-------------------------|-------------------------|
-| Important data          | Current objects         | Recently de-allocated   |
-| (1MB)                   | (2MB)                   | (1MB)                   |
-|-------------------------|-------------------------|-------------------------|
-                          ^                                                   ^
-                          |                                                   |
-                  current_offset = 3MB                               capacity = 4MB
-
-
-After fast_compact_tier(TIER.Middle, 1MB):
-[TIER BASE]
-|-------------------------|-------------------------|-------------------------|
-| Important data          | "Garbage" data, but     | "Garbage" data, but     |
-| (preserved, 1MB)        | available for reuse     | available for reuse     |
-|-------------------------|-------------------------|-------------------------|
-                          ^                                                   ^
-                          |                                                   |
-                  current_offset = 1MB                               capacity = 4MB
-
-
-After new allocations:
-[TIER BASE]
-|-------------------------|-------------------------|-------------------------|
-| Important data          | Newly allocated objects | "Garbage" data, but     |
-| (preserved, 1MB)        | (1.5MB)                 | available for reuse     |
-|-------------------------|-------------------------|-------------------------|
-                                                    ^                         ^
-                                                    |                         |
-                                          current_offset = 2.5MB     capacity = 4MB
-```
-
-This approach is perfect for high performance loops because:
-
-You can organize your memory so that persistent data is at the beginning and transient data comes after.
-
-When you need to recycle memory, you just preserve the persistent part and reuse the rest.
-The operation is incredibly fast since it's just an atomic store to update the allocation pointer.
-
-All new allocations will automatically respect the preserved area because the allocator's internal current_offset is pointing just after it. This is all handled seamlessly by the bump allocator design.
-
-Matches high performance lifecycle perfectly:
-
-- Persistent data stays at the beginning (preserved section)
-- Current visible/active objects occupy the middle (new allocations)
-- Previously visible but now culled objects' memory is automatically recycled
-
-Zero-cost memory recycling:
-
-- When objects get culled from view, you don't need to explicitly free each one
-- Simply call fast_compact_tier() with your preservation size, and all memory beyond that point becomes available instantaneously
-- No fragmentation to worry about - the "garbage" data is simply overwritten
-
-Perfect alignment with visibility culling:
-
-- As the player moves through the high performance world, new objects come into view while others leave
-- This allocator naturally accommodates this pattern without complex memory tracking
-
-Efficient for WASM environments:
-
-- WebAssembly has a linear memory model with growing costs
-- This allocator minimizes the need to grow memory by efficiently recycling existing pages
-- The high water mark tracking helps you optimize memory usage over time
-
-Tiered Reserve & Grow Behviour:
-
-- When asked for reservation that exceeds the available tier space, grow, but check if the grow is feasible within the max 4GB memory limit by looking at the preserved contents of the other tiers.
-- When a tier asks for reservation, but 4GB max has already been hit, Attempt to recycle memory in the appropriate tier, Try the allocation again with the newly reclaimed space,
-  & Only fail if recycling doesn't free enough space.
-
-## Caching Considerations
-
-When implementing a producer-consumer system with caching:
-Problem: If you use a flag to indicate available memory and write to cache first, subsequent reads may retrieve stale data.
-Explanation: In a producer-consumer setup with caching:
-
-- The producer writes data to cache
-- The producer sets a flag to true indicating memory is available
-- The consumer checks the flag, sees it's true, and reads from cache
-- However, if memory was updated directly (bypassing cache), the cache becomes stale
-
-Solution: Always invalidate the cache before setting the availability flag. This ensures that:
-
-- The next read operation will fetch fresh data from memory
-- The consumer will always see the most recent updates
-
-This prevents the race condition where cache contains outdated information while the flag indicates data is ready.
-This technique is called "polling" or "scheduled polling" and is common in page based memory allocators.
-
-## Advanced Considerations - Partially Implemented
-
-### Vectorization and SIMD
-
-WASM can use SIMD (Single Instruction, Multiple Data) instructions to process multiple bytes at once:
+The implementation uses an offset-based addressing system that solves cross-platform memory management challenges:
 
 ```rust
-// Import WASM SIMD intrinsics
-use core::arch::wasm32::*;
+pub struct LockFreeArena {
+    base_offset: usize,  // Global offset from GLOBAL_MEMORY_BASE
+}
 
-// Example: Fill memory with a value using v128 operations (16 bytes at once)
-pub fn fast_fill(ptr: *mut u8, size: usize, value: u8) {
-    let aligned_size = size & !15; // Round down to multiple of 16
-    let simd_value = v128_set_splat_i8(value as i8);
+pub struct MemoryHandle(usize);  // Always stores global offset
+```
 
-    // Process 16 bytes at a time
-    for i in (0..aligned_size).step_by(16) {
-        unsafe {
-            let dest = ptr.add(i) as *mut v128;
-            v128_store(dest, simd_value);
-        }
-    }
+**Key Benefits:**
 
-    // Handle remaining bytes
-    for i in aligned_size..size {
-        unsafe {
-            *ptr.add(i) = value;
-        }
+1. **WASM Memory Growth Safety**: Handles remain valid when WebAssembly memory grows
+2. **Unified Handle Representation**: Consistent 64-bit representation across platforms
+3. **Zero-Cost Platform Abstraction**: Platform-specific translation only at pointer conversion
+4. **Serializable Handles**: Can be stored/transmitted as simple integers
+
+**Platform Translation:**
+
+```rust
+impl MemoryHandle {
+    pub fn to_ptr(self) -> *mut u8 {
+        #[cfg(target_arch = "wasm32")]
+        { self.0 as *mut u8 }  // Direct offset in WASM
+
+        #[cfg(not(target_arch = "wasm32"))]
+        { unsafe { GLOBAL_MEMORY_BASE.add(self.0) } }  // Base + offset
     }
 }
 ```
 
-### Type Punning for Wider Access
+### Allocation Strategy
 
-Use a wider type for more efficient memory access:
+The `LockFreeArena` employs a hybrid allocation approach:
+
+1. **Primary**: Atomic bump allocation for O(1) performance
+2. **Secondary**: Size-classed freelists for memory recycling
+3. **Fallback**: Platform-specific memory growth (WASM only)
+
+**Size Class Calculation:**
 
 ```rust
-pub fn fast_copy_u32(src: *const u8, dst: *mut u8, count_bytes: usize) {
-    let count_u32 = count_bytes / 4;
+fn size_class_for(size: usize) -> usize {
+    (size.max(32).trailing_zeros() as usize).saturating_sub(5).min(7)
+}
+```
 
-    // Reinterpret as u32 pointers
-    let src_u32 = src as *const u32;
-    let dst_u32 = dst as *mut u32;
+This provides 8 size classes starting from 32 bytes, doubling each tier.
 
-    // Copy 4 bytes at a time
-    for i in 0..count_u32 {
-        unsafe {
-            *dst_u32.add(i) = *src_u32.add(i);
-        }
-    }
+### Thread Safety Model
 
-    // Handle remaining bytes
-    for i in (count_u32 * 4)..count_bytes {
-        unsafe {
-            *dst.add(i) = *src.add(i);
-        }
+The allocator is thread-safe:
+
+- All shared state uses atomic operations
+- No data races possible through the public API
+- Arena isolation prevents cross-arena interference
+- Deallocation safety checks prevent cross-tier corruption
+
+```rust
+pub fn deallocate(&self, handle: MemoryHandle, size: usize) -> bool {
+    let handle_offset = handle.offset();
+    if handle_offset < self.base_offset ||
+       handle_offset >= self.base_offset + self.size.load(Ordering::Relaxed) {
+        return false;  // Prevents cross-arena deallocation
     }
 }
 ```
 
-### Alignment Operations
+**Memory Ordering:**
 
-Ensuring your memory operations are aligned to cache line boundaries:
+- `Relaxed` for stat updates
+- `Acquire/Release` for freelist operations
+- `SeqCst` only for reset operations
+
+### Fast Memory Compaction
+
+The `fast_compact_tier` function provides zero-cost memory recycling:
 
 ```rust
-pub fn aligned_copy(src: *const u8, dst: *mut u8, size: usize) {
-    // Check if pointers are aligned to cache line (64 bytes)
-    if (src as usize % 64 == 0) && (dst as usize % 64 == 0) && (size % 64 == 0) {
-        // Fast path: 64-byte aligned copy
-        for i in (0..size).step_by(64) {
-            // Copy an entire cache line at once
-            unsafe {
-                let src_ptr = src.add(i) as *const [u8; 64];
-                let dst_ptr = dst.add(i) as *mut [u8; 64];
-                *dst_ptr = *src_ptr;
-            }
-        }
-    } else {
-        // Fallback for unaligned memory
-        for i in 0..size {
-            unsafe {
-                *dst.add(i) = *src.add(i);
-            }
-        }
+pub fn fast_compact_tier(&self, tier: Tier, preserve_bytes: usize) -> bool {
+    arena.allocation_head.store(preserve_bytes, Ordering::SeqCst);
+
+    // Clear freelists as they contain pointers beyond preserve_bytes
+    for freelist in &arena.freelists {
+        freelist.store(std::ptr::null_mut(), Ordering::SeqCst);
     }
 }
 ```
+
+**Visual Example:**
+
+```
+Before: |Important data (1MB)|Current objects (2MB)|Recently freed (1MB)|
+After:  |Important data (1MB)|<-- Available for reuse (3MB) -->|
+```
+
+## Performance Optimizations
+
+### SIMD Operations
+
+Platform-specific SIMD acceleration:
+
+| Copy Size           | Strategy                          |
+| ------------------- | --------------------------------- |
+| 1-32 bytes          | Direct unaligned loads/stores     |
+| 33-128 bytes        | Overlapping 128-bit operations    |
+| >128 bytes (x86_64) | AVX2 with 4x unrolling + prefetch |
+| >128 bytes (WASM)   | SIMD128 with 4x16-byte unrolling  |
+
+Prefetching activates for copies >4KB to optimize cache usage.
+
+#### Performance Benchmarks
+
+Real-world SIMD performance comparison between Native (x86_64 AVX2) and WASM (SIMD128):
+
+| Buffer Size | Native Time (ns) | Native (MB/s) | WASM Time (ns) | WASM (MB/s) | Native Advantage |
+| ----------- | ---------------- | ------------- | -------------- | ----------- | ---------------- |
+| 6 bytes     | 25               | 228.88        | 261            | 22.90       | 10.4x faster     |
+| 8 bytes     | 25               | 305.18        | 227            | 34.43       | 9.1x faster      |
+| 13 bytes    | 26               | 476.84        | 210            | 60.36       | 8.1x faster      |
+| 14 bytes    | 25               | 534.06        | 193            | 70.90       | 7.7x faster      |
+| 19 bytes    | 25               | 724.79        | 197            | 93.99       | 7.9x faster      |
+| 27 bytes    | 26               | 990.35        | 354            | 74.51       | 13.6x faster     |
+| 32 bytes    | 24               | 1,271.57      | 172            | 181.34      | 7.2x faster      |
+| 64 bytes    | 30               | 2,034.51      | 275            | 227.03      | 9.2x faster      |
+| 100 bytes   | 26               | 3,667.98      | 194            | 502.25      | 7.5x faster      |
+| 256 bytes   | 27               | 9,042.25      | 173            | 1,410.30    | 6.4x faster      |
+| 1 KB        | 31               | 31,502.02     | 188            | 5,326.80    | 6.1x faster      |
+| 4 KB        | 52               | 75,120.19     | 225            | 17,745.60   | 4.3x faster      |
+| 16 KB       | 147              | 106,292.52    | 433            | 36,921.60   | 2.9x faster      |
+| 64 KB       | 1,302            | 48,003.07     | 2,476          | 25,856.00   | 1.9x faster      |
+
+**Key Observations:**
+
+- Native AVX2 achieves remarkably consistent low latency (24-52ns) for buffers up to 4KB
+- WASM SIMD128 shows more variable latency, particularly for small buffers
+- The performance gap is most pronounced for small buffers (7-13x faster)
+- For large buffers (64KB), both implementations are memory-bandwidth limited
+- WASM still achieves respectable throughput (>25 GB/s) for large transfers
+
+### Platform-Specific Optimizations
+
+```rust
+// Native: Global base pointer
+#[cfg(not(target_arch = "wasm32"))]
+static mut GLOBAL_MEMORY_BASE: *mut u8 = std::ptr::null_mut();
+
+// WASM: Linear memory always starts at 0
+#[cfg(target_arch = "wasm32")]
+let memory_base = 0 as *mut u8;
+
+// Null handling via MAX (0 is valid in WASM)
+pub fn is_null(self) -> bool { self.0 == usize::MAX }
+pub fn null() -> Self { MemoryHandle(usize::MAX) }
+```
+
+## Core API
+
+### Memory Management
+
+```rust
+// Allocation
+allocate(size: usize, tier: Tier) -> Option<MemoryHandle>
+allocate_batch(requests: &[(usize, Tier)]) -> Vec<Option<MemoryHandle>>
+
+// Memory recycling (WASM only)
+fast_compact_tier(tier: Tier, preserve_bytes: usize) -> bool
+
+// Tier management
+reset_tier(tier: Tier)
+tier_stats(tier: Tier) -> (usize, usize, usize, usize)
+```
+
+### Data Operations
+
+```rust
+write_data(handle: MemoryHandle, data: &[u8]) -> Result<(), &'static str>
+read_data(handle: MemoryHandle, length: usize) -> Option<Vec<u8>>
+bulk_copy(operations: &[(MemoryHandle, MemoryHandle, usize)])
+```
+
+### Asset Management
+
+```rust
+// Configuration
+set_base_url(url: String)
+
+// Asset operations
+register_asset(key: String, metadata: AssetMetadata) -> bool
+evict_asset(path: &str) -> bool
+evict_assets_batch(paths: &[String]) -> usize
+get_asset(path: &str) -> Option<AssetMetadata>
+
+// Loading
+load_asset(path: String, asset_type: AssetType) -> Result<MemoryHandle, String>
+load_assets_batch(requests: Vec<(String, AssetType)>) -> Vec<Result<MemoryHandle, String>>
+load_asset_zero_copy(data: &[u8], tier: Tier) -> Option<MemoryHandle>
+```
+
+## WebAssembly Integration
+
+The `WallocWrapper` provides JavaScript-friendly bindings:
+
+- Direct TypedArray access via `get_memory_view`
+- Async asset loading with Promises
+- Memory growth management
+- Real-time statistics and diagnostics
+
+## Binary Sizes
+
+| Component   | Native | WASM  |
+| ----------- | ------ | ----- |
+| Raw Library | 55KB   | 55KB  |
+| Rlib        | 286KB  | 822KB |
+| Module      | 15KB   | 798KB |
+| JS Glue     | -      | 30KB  |
+
+## Setup & Testing
+
+```bash
+# Install prerequisites
+rustup target add wasm32-unknown-unknown
+
+# Build
+cd walloc/
+bash build.sh  # Choose (1) WASM or (2) Native
+
+# Test
+# Native: Auto-runs test binary
+# WASM: Serve index.html and check console
+```
+
+## Security & Safety
+
+- Bounds checking on all public APIs
+- Arena boundary validation
+- Null pointer protection with graceful degradation
+- No buffer overruns through safe API
+- Cross-tier corruption prevention
+
+## Recommendations for Future Enhancement
+
+1. **Configurable Tier Ratios**: Runtime memory distribution specification
+2. **Block Coalescing**: Reduce long-term fragmentation
+3. **Per-Tier Growth**: Independent tier expansion for WASM
+4. **Allocation Profiling**: Track hot allocation sites
+5. **API Documentation**: Explicit handle stability guarantees
+
+## Design Philosophy
+
+Walloc embodies these principles:
+
+- **Ma (間)**: Empty space as design element.
+- **Kanso (簡素)**: Simplicity - no decorative abstractions.
+- **Shizen (自然)**: Naturalness - memory flows like water finding its level.
+- **Shibui (渋い)**: Understated elegance - beauty in what's NOT there.
